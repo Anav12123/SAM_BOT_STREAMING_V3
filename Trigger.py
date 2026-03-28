@@ -157,29 +157,17 @@
 #             )
 #             decision = response.choices[0].message.content.strip().upper()
 #             return "YES" in decision
-#         except Exception as e:
-#             print(f"[Trigger] Error: {e}")
-#             return text.strip().endswith("?")
-
-#     def mark_responded(self):
-#         self._last_response_at = time.monotonic()
 
 """
-Trigger.py
-Fast-path triggers (no LLM call) cover ~80% of cases:
-  - Direct address ("sam") → YES immediately
-  - Trivial fillers → NO immediately
-  - Incomplete endings → wait
-  - Memory recall keywords → YES immediately
-  - Question ending "?" → YES immediately
-  - 2+ PM keywords → YES immediately
-  - Recent follow-up (< 3s) → YES immediately
-  - Cooldown gate → NO
-  - Ambiguous phrases → LLM decision (~200-700ms)
+Trigger.py — OPTIMIZED
+Changes:
+  1. Broader fast-path patterns ("about you", "tell me", etc.) → instant YES
+  2. Groq LLM fallback capped at 500ms → default YES on timeout
 """
 
 import time
 import os
+import asyncio
 from openai import AsyncOpenAI
 
 COOLDOWN_SECONDS = 1.5
@@ -226,7 +214,7 @@ FILLERS = {
     "alright", "hmm", "uh huh", "got it", "bye", "yeah", "yes",
     "no", "cool", "nice", "great", "perfect", "sounds good",
     "i see", "right", "okay okay", "ok ok",
-    # Extended fillers — common acknowledgments that should never trigger Sam
+    # Extended fillers
     "interesting", "i see", "noted", "understood", "makes sense",
     "fair enough", "true", "exactly", "absolutely", "definitely",
     "of course", "certainly", "indeed", "wow", "oh", "ah",
@@ -242,6 +230,14 @@ RECALL_KEYWORDS = [
     "before", "earlier", "told you", "mentioned",
     "remember", "what did i say", "recall", "last time",
     "previously", "you said",
+]
+
+# NEW: broader patterns that clearly need Sam to respond
+DIRECT_ADDRESS_PATTERNS = [
+    "sam", "about you", "about yourself", "tell me",
+    "what do you", "can you", "could you", "would you",
+    "your opinion", "your thoughts", "what's your",
+    "introduce yourself", "who are you",
 ]
 
 
@@ -263,13 +259,13 @@ class TriggerDetector:
         now   = time.monotonic()
         lower = text.lower().strip()
 
-        # Direct address — always YES, instant
-        if "sam" in lower:
+        # Direct address patterns — instant YES
+        if any(p in lower for p in DIRECT_ADDRESS_PATTERNS):
             self._last_response_at = 0
             print("  ⚡ Direct address — YES")
             return True
 
-        # Trivial fillers — always NO, instant
+        # Trivial fillers — instant NO
         if lower in FILLERS:
             return False
 
@@ -280,17 +276,17 @@ class TriggerDetector:
             print("  ⏸ Incomplete — waiting")
             return False
 
-        # Memory recall — always YES, instant
+        # Memory recall — instant YES
         if any(k in lower for k in RECALL_KEYWORDS):
             print("  🧠 Recall detected — YES")
             return True
 
-        # Question ending — almost always directed at Sam in 1:1 context
+        # Question ending — YES
         if lower.endswith("?"):
             print("  ❓ Question — YES")
             return True
 
-        # 2+ PM keywords — relevant to Sam's domain
+        # 2+ PM keywords — YES
         pm_hits = {k for k in PM_KEYWORDS if k in lower}
         if len(pm_hits) >= 2:
             print(f"  🏷️  PM keywords ({pm_hits}) — YES")
@@ -305,7 +301,7 @@ class TriggerDetector:
         if now - self._last_response_at < COOLDOWN_SECONDS:
             return False
 
-        # LLM decision — only hits here for ambiguous phrases
+        # LLM decision — CAPPED at 500ms, default YES on timeout
         memory_hint = "\n".join(memory[-5:]) if memory else "None"
         return await self._groq_decide(text, speaker, context, memory_hint)
 
@@ -313,22 +309,30 @@ class TriggerDetector:
         self, text: str, speaker: str, context: str, memory: str
     ) -> bool:
         try:
-            response = await self._client.chat.completions.create(
-                model="llama-3.1-8b-instant",
-                messages=[{
-                    "role": "user",
-                    "content": TRIGGER_PROMPT.format(
-                        context=context or "No prior context",
-                        speaker=speaker,
-                        text=text,
-                        memory=memory,
-                    )
-                }],
-                temperature=0,
-                max_tokens=3,
+            response = await asyncio.wait_for(
+                self._client.chat.completions.create(
+                    model="llama-3.1-8b-instant",
+                    messages=[{
+                        "role": "user",
+                        "content": TRIGGER_PROMPT.format(
+                            context=context or "No prior context",
+                            speaker=speaker,
+                            text=text,
+                            memory=memory,
+                        )
+                    }],
+                    temperature=0,
+                    max_tokens=3,
+                ),
+                timeout=0.5,  # 500ms hard cap
             )
             decision = response.choices[0].message.content.strip().upper()
-            return "YES" in decision
+            result = "YES" in decision
+            print(f"  🤖 LLM trigger: {'YES' if result else 'NO'}")
+            return result
+        except asyncio.TimeoutError:
+            print("  ⏱️  LLM trigger timeout — defaulting YES")
+            return True
         except Exception as e:
             print(f"[Trigger] Error: {e}")
             return text.strip().endswith("?")
