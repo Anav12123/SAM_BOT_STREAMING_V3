@@ -354,6 +354,115 @@ class PMAgent:
     async def respond(self, user_text: str) -> str:
         return await self.respond_with_context(user_text, "")
 
+    # ── NEW: stream sentences as LLM generates them ──────────────────────────
+    async def stream_sentences_to_queue(
+        self,
+        user_text: str,
+        context: str,
+        queue: "asyncio.Queue",
+    ):
+        """
+        Streams LLM tokens, detects sentence boundaries (. ! ?),
+        pushes each complete sentence into the queue as soon as it's ready.
+        Pushes None as sentinel when done.
+        
+        This lets TTS fire on sentence 1 while LLM is still generating sentence 2.
+        """
+        import asyncio
+
+        self._store_memory(user_text)
+        rag = self._search_memory(user_text, top_k=2)
+
+        # ── Web search path ──────────────────────────────────────────────────
+        search_needed = await self._needs_web_search(user_text)
+        if search_needed:
+            print(f"[Agent] Searching web for: {user_text}")
+            try:
+                search_results = await self._get_web_search().search(user_text)
+                if not search_results:
+                    await queue.put("Hmm, couldn't find that online right now.")
+                    await queue.put(None)
+                    return
+                print(f"[Agent] Got search results, summarizing...")
+                system = WEB_SEARCH_PROMPT.format(search_results=search_results[:500])
+                messages = [
+                    {"role": "system", "content": system},
+                    {"role": "user",   "content": user_text},
+                ]
+                max_tok = 50
+            except Exception as e:
+                print(f"[Agent] Web search failed: {e}")
+                await queue.put("Hmm, I couldn't look that up right now.")
+                await queue.put(None)
+                return
+        else:
+            # ── Normal conversational path ────────────────────────────────────
+            parts = []
+            if rag:
+                parts.append(f"Memory: {' | '.join(rag)}")
+            if context:
+                recent = "\n".join(context.split("\n")[-3:])
+                parts.append(f"Recent: {recent}")
+            parts.append(f"User: {user_text}")
+            full_text = "\n".join(parts)
+            system = SYSTEM_PROMPT
+
+            self.history.append({"role": "user", "content": full_text})
+            if len(self.history) > 6:
+                self.history = self.history[-6:]
+
+            messages = [{"role": "system", "content": system}] + self.history
+            max_tok = 50
+
+        # ── Stream tokens, yield sentences ────────────────────────────────────
+        try:
+            stream = await self.client.chat.completions.create(
+                model=self.deployment,
+                messages=messages,
+                temperature=0.7 if not search_needed else 0.5,
+                max_tokens=max_tok,
+                stream=True,
+            )
+
+            buffer = ""
+            full_response = ""
+            async for chunk in stream:
+                token = chunk.choices[0].delta.content if chunk.choices else None
+                if not token:
+                    continue
+                buffer += token
+                full_response += token
+
+                # Check for sentence boundaries
+                while True:
+                    indices = [buffer.find(c) for c in ".!?" if buffer.find(c) != -1]
+                    if not indices:
+                        break
+                    idx = min(indices)
+                    sentence = buffer[:idx+1].strip()
+                    buffer = buffer[idx+1:].lstrip()
+                    if sentence:
+                        await queue.put(sentence)
+
+            # Push any remaining text
+            if buffer.strip():
+                await queue.put(buffer.strip())
+
+            full_response = full_response.strip()
+            # Update history + memory
+            if not search_needed:
+                self.history.append({"role": "assistant", "content": full_response})
+            else:
+                self.history.append({"role": "user",      "content": user_text})
+                self.history.append({"role": "assistant", "content": full_response})
+            self._store_memory(full_response)
+
+        except Exception as e:
+            print(f"[Agent] Stream error: {e}")
+            await queue.put("Hmm, something went wrong on my end.")
+        finally:
+            await queue.put(None)  # sentinel
+
     async def respond_with_context(
         self,
         user_text: str,
