@@ -499,25 +499,23 @@ class WebSocketServer:
         await self._speak_response(greeting, t0)
 
     # ══════════════════════════════════════════════════════════════════════════
-    # _process — OPTIMIZED: parallel TTS per sentence → concat → single inject
+    # _process — FULLY OPTIMIZED: streaming LLM → TTS as sentences arrive → concat → single inject
     #
-    # Same flow as original:
-    #   1. Fire trigger + LLM in parallel
-    #   2. Wait for trigger → if NO, cancel LLM
-    #   3. Wait for LLM → get full response
+    # Flow:
+    #   1. Fire trigger + LLM-stream in TRUE parallel
+    #   2. LLM pushes sentences into queue as it generates tokens
+    #   3. TTS fires on each sentence THE MOMENT it arrives (overlaps with LLM)
+    #   4. After all sentences + all TTS done: concatenate into ONE MP3
+    #   5. Single inject → seamless audio, zero gaps
     #
-    # NEW after step 3:
-    #   4. Split response into sentences
-    #   5. TTS each sentence in PARALLEL (asyncio.gather)
-    #   6. Concatenate audio bytes into ONE seamless MP3
-    #   7. Single inject → zero gaps
+    # Example timeline for 2-sentence response:
+    #   0ms:   trigger + LLM start
+    #   ~5ms:  trigger YES (fast path)
+    #   ~150ms: LLM sentence 1 ready → TTS1 fires
+    #   ~300ms: LLM sentence 2 ready → TTS2 fires (TTS1 still running)
+    #   ~1150ms: TTS1 done
+    #   ~1300ms: TTS2 done → concat → inject
     # ══════════════════════════════════════════════════════════════════════════
-
-    def _split_sentences(self, text: str) -> list[str]:
-        """Split text into sentences on . ! ? boundaries."""
-        import re
-        parts = re.split(r'(?<=[.!?])\s+', text.strip())
-        return [p.strip() for p in parts if p.strip()]
 
     async def _process(self, text: str, speaker: str, t0: float, generation: int = 0):
         if self._speaking:
@@ -533,15 +531,19 @@ class WebSocketServer:
             memory_snapshot = [m[0] for m in self.agent.memory[-20:]]
 
             t1 = time.time()
-            print(f"[{ts()}] Trigger + LLM in parallel...")
 
+            # ── Fire trigger + LLM stream in TRUE parallel ────────────────────
+            sentence_queue = asyncio.Queue()
+            llm_task = asyncio.create_task(
+                self.agent.stream_sentences_to_queue(text, context, sentence_queue)
+            )
             trigger_task = asyncio.create_task(
                 self.trigger.should_respond(text, speaker, context, memory_snapshot)
             )
-            llm_task = asyncio.create_task(
-                self.agent.respond_with_context(text, context)
-            )
 
+            print(f"[{ts()}] Trigger + LLM streaming in parallel...")
+
+            # Wait for trigger (LLM is already streaming and buffering sentences)
             should = await trigger_task
             print(f"[{ts()}] Trigger: {'YES' if should else 'NO'} ({elapsed(t1)})")
 
@@ -549,67 +551,75 @@ class WebSocketServer:
                 llm_task.cancel()
                 return
 
-            response = await llm_task
+            # ── Collect sentences + fire TTS as each arrives ──────────────────
+            sentences: list[str] = []
+            tts_tasks: list[asyncio.Task] = []
 
-            # Check if superseded during LLM
-            if self._interrupt_event.is_set() or my_generation != self._generation:
-                print(f"[{ts()}] ⚡ Superseded during LLM — discarding")
+            while True:
+                if self._interrupt_event.is_set() or my_generation != self._generation:
+                    print(f"[{ts()}] ⚡ Superseded — aborting")
+                    llm_task.cancel()
+                    for t_task in tts_tasks:
+                        t_task.cancel()
+                    return
+
+                try:
+                    item = await asyncio.wait_for(sentence_queue.get(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    print(f"[{ts()}] ⚠️  LLM queue timeout")
+                    break
+
+                if item is None:  # sentinel — LLM done
+                    break
+
+                sentence = item
+                sentences.append(sentence)
+                idx = len(sentences)
+                print(f"[{ts()}] LLM sentence {idx} ({elapsed(t1)}): \"{sentence}\"")
+
+                # Fire TTS immediately — runs in parallel with LLM generating next sentence
+                tts_task = asyncio.create_task(self.speaker._synthesise(sentence))
+                tts_tasks.append(tts_task)
+
+            if not sentences or not tts_tasks:
                 return
 
-            print(f"[{ts()}] LLM {elapsed(t1)}: \"{response}\"")
-
-            # ── Split into sentences + parallel TTS ───────────────────────────
-            sentences = self._split_sentences(response)
-            if not sentences:
-                sentences = [response]  # fallback: TTS whole thing
-
+            # ── Await all TTS results ─────────────────────────────────────────
+            # Most/all should already be done since they ran during LLM streaming
             t2 = time.time()
-            if len(sentences) == 1:
-                # Single sentence — TTS directly (no split overhead)
-                print(f"[{ts()}] TTS (1 sentence)...")
-                try:
-                    voice_bytes = await asyncio.wait_for(
-                        self.speaker._synthesise(sentences[0]), timeout=10.0
-                    )
-                except Exception as e:
-                    print(f"[{ts()}] ⚠️  TTS error: {e}")
-                    return
-                audio_bytes = voice_bytes
-            else:
-                # Multiple sentences — TTS ALL in parallel
-                print(f"[{ts()}] TTS ({len(sentences)} sentences in parallel)...")
-                tts_tasks = [
-                    asyncio.create_task(self.speaker._synthesise(s))
-                    for s in sentences
-                ]
-                results = await asyncio.gather(*tts_tasks, return_exceptions=True)
-                audio_chunks = []
-                for i, result in enumerate(results):
-                    if isinstance(result, Exception):
-                        print(f"[{ts()}] ⚠️  TTS sentence {i+1} failed: {result}")
-                    else:
-                        audio_chunks.append(result)
-                if not audio_chunks:
-                    print(f"[{ts()}] ⚠️  All TTS failed")
-                    return
-                # Concatenate MP3 bytes — frames are self-contained, seamless join
-                audio_bytes = b"".join(audio_chunks)
+            print(f"[{ts()}] TTS ({len(sentences)} sentences, parallel+streamed)...")
+            results = await asyncio.gather(*tts_tasks, return_exceptions=True)
+
+            audio_chunks = []
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    print(f"[{ts()}] ⚠️  TTS sentence {i+1} failed: {result}")
+                else:
+                    audio_chunks.append(result)
+
+            if not audio_chunks:
+                print(f"[{ts()}] ⚠️  All TTS failed")
+                return
 
             # Check if superseded during TTS
             if self._interrupt_event.is_set() or my_generation != self._generation:
                 print(f"[{ts()}] ⚡ Superseded during TTS — discarding")
                 return
 
-            tts_ms     = (time.time() - t2) * 1000
-            loop       = asyncio.get_event_loop()
+            tts_ms = (time.time() - t2) * 1000
+
+            # ── Concatenate into ONE seamless MP3 + inject ────────────────────
+            audio_bytes = b"".join(audio_chunks)
+            response = " ".join(sentences)
             word_count = len(response.split())
             audio_duration_ms = word_count * 1000 // 3
 
+            loop = asyncio.get_event_loop()
             b64 = await loop.run_in_executor(
                 None,
                 lambda ab=audio_bytes: base64.b64encode(ab).decode("utf-8")
             )
-            # Final check
+
             if self._interrupt_event.is_set() or my_generation != self._generation:
                 print(f"[{ts()}] ⚡ Superseded — skipping inject")
                 return
